@@ -112,6 +112,7 @@ class ProteinNoisedDataset(torch.utils.data.Dataset):
         
         output = {
             'r_noisy': r_noisy,  # [N, 9 or 37*3]
+            'r_0': coords,  # [N, 9 or 37*3] clean coordinates for reconstruction loss
             'trans_score': trans_score,  # [N, 9 or 37*3]
             'trans_score_scaling': torch.tensor(trans_score_scaling, dtype=torch.float),
             'mask': self.residue_mask[idx],

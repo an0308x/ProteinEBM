@@ -60,13 +60,14 @@ class ProteinScoreMatchingTrainer(pl.LightningModule):
             # Define first layer components (input embeddings)
             first_layer_components = [
                 'sequence_embedding',
-                'noisy_coord_embedding', 
+                'noisy_coord_embedding',
                 'contact_embedding',
                 'self_conditioning_embedding',
-                'atom_mask_embedding'
+                'atom_mask_embedding',
+                'autoencoder'  # Keep autoencoder trainable for latent space EBM
             ]
-            
-            # Define last layer components (output projections)  
+
+            # Define last layer components (output projections)
             last_layer_components = [
                 'r_update_proj',
                 'r_update_proj_aux',
@@ -241,11 +242,12 @@ class ProteinScoreMatchingTrainer(pl.LightningModule):
 
         # Compute losses
         final_loss = torch.tensor(0.0, device=self.device)
-        
+
         # Get loss weights from config (with defaults)
         trans_score_weight = self.config.training.get('trans_score_weight', 1.0)
         aux_weight = self.config.training.get('aux_score_weight', 0.25)
         sidechain_weight = self.config.training.get('sidechain_weight', 0.0)
+        reconstruction_weight = self.config.training.get('reconstruction_weight', 0.1)
         
         # Translation score loss
         trans_score_loss = torch.tensor(0.0, device=self.device)
@@ -275,10 +277,23 @@ class ProteinScoreMatchingTrainer(pl.LightningModule):
             masked_sidechain_mse = sidechain_mse * sidechain_mask   # [B, N, 34]
             valid_atoms = sidechain_mask.sum(dim=(-1, -2))  # [B]
 
-            sidechain_loss = masked_sidechain_mse.sum(dim=(-1, -2)) / (valid_atoms + 1e-10) 
-            
+            sidechain_loss = masked_sidechain_mse.sum(dim=(-1, -2)) / (valid_atoms + 1e-10)
+
             final_loss += sidechain_weight * sidechain_loss.mean()
-        
+
+        # Latent space reconstruction loss
+        reconstruction_loss = torch.tensor(0.0, device=self.device)
+        if reconstruction_weight > 0 and hasattr(self.model, 'use_latent_space') and self.model.use_latent_space:
+            # Get original clean coordinates from batch
+            r_0 = batch.get('r_0', None)
+            if r_0 is not None:
+                # Compute reconstruction loss
+                reconstructed, latent = self.model.autoencoder(r_0)
+                reconstruction_loss = self.model.autoencoder.reconstruction_loss(
+                    r_0, reconstructed, mask=mask_batch
+                )
+                final_loss += reconstruction_weight * reconstruction_loss
+
         # Auxiliary losses
         aux_mse_loss = torch.tensor(0.0, device=self.device)
         
@@ -306,6 +321,7 @@ class ProteinScoreMatchingTrainer(pl.LightningModule):
         self.log(f'{prefix}_trans_score_loss', trans_score_loss)
         self.log(f'{prefix}_sidechain_loss', sidechain_loss.mean())
         self.log(f'{prefix}_aux_trans_loss', aux_trans_loss.mean())
+        self.log(f'{prefix}_reconstruction_loss', reconstruction_loss)
 
 
 

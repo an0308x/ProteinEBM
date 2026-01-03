@@ -11,6 +11,8 @@ from protein_ebm.model.layers import (
     final_init_
 )
 from protein_ebm.model.boltz_utils import LinearNoBias
+from protein_ebm.model.latent_space import LatentAutoencoder
+from protein_ebm.model.latent_diffuser import LatentDiffuser
 
 
 class ProteinEBM(Module):
@@ -38,9 +40,32 @@ class ProteinEBM(Module):
         self.predict_sidechain = getattr(config, 'predict_sidechain', False) # whether to predict the sidechain coordinates as aux outputs
         self.diffuse_sidechain = getattr(config, 'diffuse_sidechain', False) # whether to diffuse sidechain atoms
 
+        # Latent space EBM configuration
+        self.use_latent_space = getattr(config, 'use_latent_space', False)
+        self.latent_dim = getattr(config, 'latent_dim', 128)
+        self.latent_num_blocks = getattr(config, 'latent_num_blocks', 3)
+
         self.data_dimension = 3 if not self.diffuse_sidechain else 37*3
 
-        self.noisy_coord_embedding = LinearNoBias(self.data_dimension, config.token_s) # 3 cartesian coords for N, C, CA, or for all 37 atoms
+        # Initialize latent autoencoder if enabled
+        if self.use_latent_space:
+            self.autoencoder = LatentAutoencoder(
+                coord_dim=self.data_dimension,
+                latent_dim=self.latent_dim,
+                num_blocks=self.latent_num_blocks,
+                hidden_multiplier=2,
+            )
+            # Create latent diffuser
+            self.latent_diffuser = LatentDiffuser(
+                config=diffuser.config,
+                latent_dim=self.latent_dim
+            )
+            # Use latent dimension for embeddings
+            self.noisy_coord_embedding = LinearNoBias(self.latent_dim, config.token_s)
+        else:
+            self.autoencoder = None
+            self.latent_diffuser = None
+            self.noisy_coord_embedding = LinearNoBias(self.data_dimension, config.token_s) # 3 cartesian coords for N, C, CA, or for all 37 atoms
 
         # Add embedding for whether a residue is in contact with another residue outside the chain
         self.contact_embedding = nn.Embedding(config.num_contact_embeddings, config.token_s)
@@ -48,7 +73,9 @@ class ProteinEBM(Module):
         # Add self-conditioning coordinate embedding if enabled
         self.use_self_conditioning = getattr(config, 'use_self_conditioning', False)
         if self.use_self_conditioning:
-            self.self_conditioning_embedding = LinearNoBias(self.data_dimension, config.token_s)
+            # Self-conditioning works in latent space if enabled
+            sc_dim = self.latent_dim if self.use_latent_space else self.data_dimension
+            self.self_conditioning_embedding = LinearNoBias(sc_dim, config.token_s)
 
         if self.diffuse_sidechain:
             self.atom_mask_embedding = LinearNoBias(37, config.token_s)
@@ -84,10 +111,13 @@ class ProteinEBM(Module):
         )
 
         self.a_norm = nn.LayerNorm(2 * config.token_s)
-        self.r_update_proj = LinearNoBias(2*config.token_s, self.data_dimension)
+
+        # Output projection: latent updates if using latent space, else coordinate updates
+        output_dim = self.latent_dim if self.use_latent_space else self.data_dimension
+        self.r_update_proj = LinearNoBias(2*config.token_s, output_dim)
 
         if self.aux_score:
-            self.r_update_proj_aux = LinearNoBias(2*config.token_s, self.data_dimension)
+            self.r_update_proj_aux = LinearNoBias(2*config.token_s, output_dim)
 
         self.sidechain_dim  = 36
 
@@ -144,20 +174,38 @@ class ProteinEBM(Module):
         if external_contacts is None:
             external_contacts = torch.zeros(B, N, dtype=torch.long, device=aatype.device)
 
-        r_noisy = r_noisy * self.diffuser.config.coordinate_scaling
-        if sc_coords is not None:
-            sc_coords = sc_coords * self.diffuser.config.coordinate_scaling
+        # Handle latent space encoding
+        if self.use_latent_space:
+            # Encode coordinates to latent space (no coordinate scaling needed)
+            z_noisy = self.autoencoder.encode(r_noisy)
+
+            # Encode self-conditioning coordinates if provided
+            if sc_coords is not None:
+                sc_latent = self.autoencoder.encode(sc_coords)
+            else:
+                sc_latent = None
+
+            # Use latent representations for embeddings
+            coord_repr = z_noisy
+            sc_repr = sc_latent if sc_latent is not None else torch.zeros_like(z_noisy)
+        else:
+            # Original coordinate space behavior
+            r_noisy = r_noisy * self.diffuser.config.coordinate_scaling
+            if sc_coords is not None:
+                sc_coords = sc_coords * self.diffuser.config.coordinate_scaling
+            coord_repr = r_noisy
+            sc_repr = sc_coords if sc_coords is not None else torch.zeros_like(r_noisy)
 
         sequence_emb = self.sequence_embedding(aatype)
 
         # Convert external_contacts to long for embedding lookup
         external_contacts_long = external_contacts.long() if external_contacts.dtype != torch.long else external_contacts
-        
+
         residue_embed = torch.cat([
-            sequence_emb, 
-            self.noisy_coord_embedding(r_noisy),
+            sequence_emb,
+            self.noisy_coord_embedding(coord_repr),
             self.contact_embedding(external_contacts_long),
-            *([self.self_conditioning_embedding(sc_coords if sc_coords is not None else torch.zeros_like(r_noisy))] if self.use_self_conditioning else []),
+            *([self.self_conditioning_embedding(sc_repr)] if self.use_self_conditioning else []),
             *([self.atom_mask_embedding(atom_mask)] if self.diffuse_sidechain else [])
         ], dim=-1)
 
@@ -253,22 +301,35 @@ class ProteinEBM(Module):
             atom_mask=atom_mask if self.diffuse_sidechain else None,
         )
 
-        # Compute energy values
+        # Compute energy values (in latent space if enabled)
         energy_values = torch.sum(model_out['r_update']**2, dim=-1)  # [batch_size, seq_len]
         model_out['energy'] = (energy_values * residue_mask).sum(dim=1)
 
         if self.aux_score:
-            # Predict denoised coordinates using the aux score
-            pred_coords = self.diffuser.calc_trans_0(
-                score_t=model_out['r_update_aux'],
-                x_t=input_feats['r_noisy'],
-                t=input_feats['t'],  # Use full batch of time values
-                use_torch=True
-            )
-            # Reshape to [B, N, 3, 3] for backbone atoms
+            if self.use_latent_space:
+                # In latent space: predict denoised latent, then decode to coords
+                z_noisy = self.autoencoder.encode(input_feats['r_noisy'])
+                pred_latent = self.latent_diffuser.calc_trans_0(
+                    score_t=model_out['r_update_aux'],
+                    z_t=z_noisy,
+                    t=input_feats['t'],
+                    use_torch=True
+                )
+                # Decode to coordinate space
+                pred_coords = self.autoencoder.decode(pred_latent)
+            else:
+                # Original coordinate space behavior
+                pred_coords = self.diffuser.calc_trans_0(
+                    score_t=model_out['r_update_aux'],
+                    x_t=input_feats['r_noisy'],
+                    t=input_feats['t'],
+                    use_torch=True
+                )
+
+            # Reshape to [B, N, 3, 3] for backbone atoms (or [B, N, 37, 3] for all atoms)
             B, N = input_feats['r_noisy'].shape[:2]
             model_out['pred_coords_aux'] = pred_coords.reshape(B, N, -1, 3)
-            
+
             # Mask pred_coords_aux to 0 where atom_mask is 0
             if self.diffuse_sidechain and atom_mask is not None:
                 model_out['pred_coords_aux'] = model_out['pred_coords_aux'] * atom_mask[..., None]
@@ -298,21 +359,34 @@ class ProteinEBM(Module):
             # Just return the energy computation without gradient
             model_out = self.compute_energy(input_feats)
             model_out['trans_score'] = model_out['r_update']
- 
-            pred_coords = self.diffuser.calc_trans_0(
-                score_t=model_out['trans_score'],
-                x_t=input_feats['r_noisy'],
-                t=input_feats['t'],  # Use full batch of time values
-                use_torch=True
-            )
+
+            if self.use_latent_space:
+                # In latent space: decode latent score to coordinate score
+                z_noisy = self.autoencoder.encode(input_feats['r_noisy'])
+                pred_latent = self.latent_diffuser.calc_trans_0(
+                    score_t=model_out['trans_score'],
+                    z_t=z_noisy,
+                    t=input_feats['t'],
+                    use_torch=True
+                )
+                pred_coords = self.autoencoder.decode(pred_latent)
+            else:
+                # Original coordinate space behavior
+                pred_coords = self.diffuser.calc_trans_0(
+                    score_t=model_out['trans_score'],
+                    x_t=input_feats['r_noisy'],
+                    t=input_feats['t'],
+                    use_torch=True
+                )
+
             # Reshape to [B, N, 3, 3] for backbone atoms
             B, N = input_feats['r_noisy'].shape[:2]
             model_out['pred_coords'] = pred_coords.reshape(B, N, -1, 3)
-            
+
             # Mask pred_coords to 0 where atom_mask is 0
             if self.diffuse_sidechain and 'atom_mask' in input_feats and input_feats['atom_mask'] is not None:
                 model_out['pred_coords'] = model_out['pred_coords'] * input_feats['atom_mask'][..., None]
-            
+
             return model_out
 
         # require gradients for input coords
@@ -332,17 +406,29 @@ class ProteinEBM(Module):
         if self.aux_score:
             model_out['trans_score_aux'] = model_out['r_update_aux']
 
-        # Update with conservative scores
+        # Update with conservative scores (gradient in coordinate space)
         model_out['trans_score'] = -grad_r
 
-        # Predict denoised coordinates using calc_trans_0
-        pred_coords = self.diffuser.calc_trans_0(
-            score_t=model_out['trans_score'],
-            x_t=r_noisy,
-            t=input_feats['t'],  # Use full batch of time values
-            use_torch=True
-        )
-            
+        if self.use_latent_space:
+            # In latent space: need to map coordinate gradients through encoder
+            # This provides the score in coordinate space for dynamics
+            z_noisy = self.autoencoder.encode(r_noisy)  # Gradients flow through encoder
+            pred_latent = self.latent_diffuser.calc_trans_0(
+                score_t=self.autoencoder.encode(-grad_r),  # Map score to latent space
+                z_t=z_noisy,
+                t=input_feats['t'],
+                use_torch=True
+            )
+            pred_coords = self.autoencoder.decode(pred_latent)
+        else:
+            # Original coordinate space behavior
+            pred_coords = self.diffuser.calc_trans_0(
+                score_t=model_out['trans_score'],
+                x_t=r_noisy,
+                t=input_feats['t'],
+                use_torch=True
+            )
+
         # Reshape to [B, N, 3, 3] for backbone atoms
         B, N = r_noisy.shape[:2]
         model_out['pred_coords'] = pred_coords.reshape(B, N, -1, 3)
